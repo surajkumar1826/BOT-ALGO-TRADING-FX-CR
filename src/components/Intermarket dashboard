@@ -1,0 +1,482 @@
+import React, { useMemo, useState } from 'react';
+import { BenchmarkId, IntermarketSnapshot, SymbolAnalysis, SymbolId } from '../types/trading';
+import { SYMBOL_LIST } from '../engine/marketData';
+import { ArrowDownRight, ArrowUpRight, Flame, RefreshCw } from 'lucide-react';
+
+interface IntermarketDashboardProps {
+  intermarket: IntermarketSnapshot;
+  onRefreshTick: () => void;
+  analyses?: Record<SymbolId, SymbolAnalysis>;
+  onSelectSymbol?: (sym: SymbolId) => void;
+}
+
+const MATRIX_IDS: BenchmarkId[] = [
+  'DXY',
+  'US10Y',
+  'VIX',
+  'USOIL',
+  'XAUUSD',
+  'EURUSD',
+  'GBPUSD',
+  'USDCAD',
+  'NAS100',
+  'US30',
+  'BTCUSD',
+];
+
+const QUICK_PAIRS: { a: BenchmarkId; b: BenchmarkId; label: string }[] = [
+  { a: 'DXY', b: 'XAUUSD', label: 'DXY vs Gold' },
+  { a: 'DXY', b: 'EURUSD', label: 'DXY vs EUR/USD' },
+  { a: 'US10Y', b: 'NAS100', label: 'US10Y vs NAS100' },
+  { a: 'BTCUSD', b: 'NAS100', label: 'BTC vs NAS100' },
+  { a: 'USOIL', b: 'USDCAD', label: 'Oil vs USD/CAD' },
+  { a: 'VIX', b: 'US30', label: 'VIX vs US30' },
+];
+
+type HeatmapCategory = 'ALL' | 'Crypto' | 'Forex' | 'Commodities' | 'Indices';
+
+function getHeatmapTileColors(changePct: number): string {
+  if (changePct >= 1.2) return 'bg-emerald-500/30 border-emerald-400/50 text-emerald-100';
+  if (changePct >= 0.35) return 'bg-emerald-500/18 border-emerald-500/35 text-emerald-200';
+  if (changePct > 0.03) return 'bg-emerald-500/10 border-emerald-500/25 text-emerald-300';
+  if (changePct <= -1.2) return 'bg-rose-500/30 border-rose-400/50 text-rose-100';
+  if (changePct <= -0.35) return 'bg-rose-500/18 border-rose-500/35 text-rose-200';
+  if (changePct < -0.03) return 'bg-rose-500/10 border-rose-500/25 text-rose-300';
+  return 'bg-[var(--bg-inset)] border-[var(--border-hairline)] text-slate-300';
+}
+
+export const IntermarketDashboard: React.FC<IntermarketDashboardProps> = ({
+  intermarket,
+  onRefreshTick,
+  analyses,
+  onSelectSymbol,
+}) => {
+  const [pairA, setPairA] = useState<BenchmarkId>('DXY');
+  const [pairB, setPairB] = useState<BenchmarkId>('XAUUSD');
+  const [invertSecond, setInvertSecond] = useState<boolean>(false);
+  const [heatmapCat, setHeatmapCat] = useState<HeatmapCategory>('ALL');
+
+  const assetA = useMemo(() => intermarket.assets.find((a) => a.id === pairA)!, [intermarket.assets, pairA]);
+  const assetB = useMemo(() => intermarket.assets.find((a) => a.id === pairB)!, [intermarket.assets, pairB]);
+  const activeCorr = intermarket.matrix[pairA]?.[pairB] ?? 0;
+
+  const relationshipKind =
+    activeCorr >= 0.35 ? 'DIRECT' : activeCorr <= -0.35 ? 'INVERSE' : 'NEUTRAL';
+
+  // Normalize both series to % change from start of window for clean visual overlay
+  const chartData = useMemo(() => {
+    const sA = assetA.series;
+    const sB = assetB.series;
+    const baseA = sA[0] || 1;
+    const baseB = sB[0] || 1;
+    const normA = sA.map((v) => ((v - baseA) / baseA) * 100);
+    const normB = sB.map((v) => (((v - baseB) / baseB) * 100) * (invertSecond ? -1 : 1));
+    const all = [...normA, ...normB];
+    const min = Math.min(...all, -0.2);
+    const max = Math.max(...all, 0.2);
+    return { normA, normB, min, max };
+  }, [assetA.series, assetB.series, invertSecond]);
+
+  const cellStyle = (val: number, isDiag: boolean) => {
+    if (isDiag) return 'bg-slate-800/70 text-slate-400';
+    if (val >= 0.6) return 'bg-emerald-500/25 text-emerald-300 border border-emerald-500/30';
+    if (val >= 0.35) return 'bg-emerald-500/12 text-emerald-400';
+    if (val <= -0.6) return 'bg-rose-500/25 text-rose-300 border border-rose-500/30';
+    if (val <= -0.35) return 'bg-rose-500/12 text-rose-400';
+    return 'bg-[var(--bg-inset)] text-slate-400';
+  };
+
+  const heatmapItems = useMemo(() => {
+    if (!analyses) return [];
+    return SYMBOL_LIST.map((sym) => analyses[sym])
+      .filter((a) => {
+        if (!a) return false;
+        if (heatmapCat === 'ALL') return true;
+        if (heatmapCat === 'Commodities') return a.meta.category === 'Metals' || a.meta.category === 'Energy';
+        return a.meta.category === heatmapCat;
+      })
+      .sort((a, b) => b.changePct - a.changePct);
+  }, [analyses, heatmapCat]);
+
+  return (
+    <div className="space-y-6">
+      {/* Macro Regime Header */}
+      <div className="border border-[var(--border-hairline)] bg-[var(--bg-surface)] rounded-lg p-5">
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div className="space-y-1.5 max-w-3xl">
+            <div className="flex items-center gap-3 text-xs text-slate-400">
+              <span>Intermarket Macro Regime</span>
+              <span aria-hidden="true">·</span>
+              <span
+                className={
+                  intermarket.regime === 'RISK_ON'
+                    ? 'text-emerald-400 font-semibold'
+                    : intermarket.regime === 'RISK_OFF'
+                      ? 'text-rose-400 font-semibold'
+                      : 'text-amber-400 font-semibold'
+                }
+              >
+                {intermarket.regime.replace('_', ' ')} MODE
+              </span>
+            </div>
+            <h2 className="text-lg font-display font-semibold text-slate-100">{intermarket.regimeSummary}</h2>
+            <p className="text-sm text-slate-400">{intermarket.preferredBias}</p>
+          </div>
+          <button
+            onClick={onRefreshTick}
+            className="flex items-center gap-2 px-3.5 py-2 text-xs font-medium bg-[var(--bg-elevated)] hover:bg-[var(--border-strong)] text-slate-200 border border-[var(--border-strong)] rounded-md transition-colors whitespace-nowrap shrink-0"
+          >
+            <RefreshCw className="w-3.5 h-3.5" />
+            Step Macro Tick
+          </button>
+        </div>
+
+        {/* Benchmark Live Strip */}
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mt-5 pt-4 border-t border-[var(--border-hairline)]">
+          {[...intermarket.assets.slice(0, 5), intermarket.assets.find((a) => a.id === 'BTCUSD')]
+            .filter((x): x is NonNullable<typeof x> => Boolean(x))
+            .map((a) => (
+              <div key={a.id} className="bg-[var(--bg-inset)] border border-[var(--border-hairline)] rounded-md p-3">
+                <div className="flex items-center justify-between text-xs text-slate-400">
+                  <span className="font-mono font-medium text-slate-200">{a.id}</span>
+                  <span className={a.changePct >= 0 ? 'text-emerald-400 font-mono' : 'text-rose-400 font-mono'}>
+                    {a.changePct >= 0 ? '+' : ''}
+                    {a.changePct.toFixed(2)}%
+                  </span>
+                </div>
+                <div className="mt-1 flex items-baseline justify-between">
+                  <span className="text-base font-mono font-semibold text-slate-100 tabular-nums">
+                    {a.id === 'BTCUSD'
+                      ? a.price.toLocaleString(undefined, { maximumFractionDigits: 1 })
+                      : a.price.toFixed(a.id === 'VIX' || a.id === 'USOIL' || a.id === 'XAUUSD' ? 2 : 3)}
+                  </span>
+                  <span className="text-[11px] text-slate-500">{a.trend}</span>
+                </div>
+              </div>
+            ))}
+        </div>
+      </div>
+
+      {/* Global & Crypto Market Performance Heatmap */}
+      {analyses && heatmapItems.length > 0 && (
+        <div className="border border-[var(--border-hairline)] bg-[var(--bg-surface)] rounded-lg p-5 space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div className="flex items-center gap-2">
+                <Flame className="w-4 h-4 text-[var(--accent-text)]" />
+                <h3 className="text-sm font-display font-semibold text-slate-100">
+                  Crypto &amp; Global Multi-Asset Market Heatmap
+                </h3>
+              </div>
+              <p className="text-xs text-slate-400 mt-0.5">
+                Live relative strength across Crypto (24/7), Forex, Metals, Energy &amp; Indices. Click any tile to open on chart.
+              </p>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-1 bg-[var(--bg-inset)] p-1 rounded border border-[var(--border-hairline)] text-xs font-mono">
+              {(
+                [
+                  { id: 'ALL', label: 'All (16)' },
+                  { id: 'Crypto', label: 'Crypto 24/7' },
+                  { id: 'Forex', label: 'Forex' },
+                  { id: 'Commodities', label: 'Metals & Oil' },
+                  { id: 'Indices', label: 'Indices' },
+                ] as { id: HeatmapCategory; label: string }[]
+              ).map((tab) => (
+                <button
+                  key={tab.id}
+                  type="button"
+                  onClick={() => setHeatmapCat(tab.id)}
+                  className={`px-2.5 py-1 rounded transition-colors whitespace-nowrap shrink-0 ${
+                    heatmapCat === tab.id
+                      ? 'bg-[var(--accent)] text-[var(--accent-fg)] font-semibold'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-2.5">
+            {heatmapItems.map((item) => {
+              const score = item.bestSetup?.score ?? 0;
+              const winRate = item.backtestStats?.winRate ?? 0;
+              const open = item.marketOpen ?? true;
+              return (
+                <button
+                  key={item.meta.id}
+                  type="button"
+                  onClick={() => onSelectSymbol?.(item.meta.id)}
+                  className={`text-left p-3 rounded-md border transition-transform hover:brightness-110 ${getHeatmapTileColors(
+                    item.changePct
+                  )}`}
+                >
+                  <div className="flex items-center justify-between gap-1">
+                    <span className="font-mono text-xs font-bold text-slate-100">{item.meta.id}</span>
+                    <span
+                      className={`text-[9.5px] font-mono px-1.5 py-0.5 rounded ${
+                        open
+                          ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/35'
+                          : 'bg-amber-500/15 text-amber-300 border border-amber-500/35'
+                      }`}
+                    >
+                      {item.meta.category === 'Crypto' ? '24/7' : open ? 'LIVE' : 'CLOSED'}
+                    </span>
+                  </div>
+                  <div className="mt-1.5 flex items-baseline justify-between gap-2 font-mono tabular-nums">
+                    <span className="text-sm font-semibold text-white">
+                      {item.currentPrice.toFixed(item.meta.decimals)}
+                    </span>
+                    <span
+                      className={`text-xs font-bold ${
+                        item.changePct >= 0 ? 'text-emerald-300' : 'text-rose-300'
+                      }`}
+                    >
+                      {item.changePct >= 0 ? '+' : ''}
+                      {item.changePct.toFixed(2)}%
+                    </span>
+                  </div>
+                  <div className="mt-2 pt-1.5 border-t border-white/10 flex items-center justify-between text-[10px] font-mono text-slate-300">
+                    <span>{item.htfBiasSummary?.direction ?? item.h4Trend}</span>
+                    <span>
+                      S:{score} · WR:{winRate.toFixed(0)}%
+                    </span>
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Main Split: Pearson Matrix + Pairwise Divergence Overlay */}
+      <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
+        {/* N x N Correlation Heatmap */}
+        <div className="xl:col-span-7 min-w-0 border border-[var(--border-hairline)] bg-[var(--bg-surface)] rounded-lg p-5 overflow-x-auto">
+          <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+            <div>
+              <h3 className="text-sm font-display font-semibold text-slate-100">
+                Rolling Intermarket Correlation Matrix (90-Bar Log Returns)
+              </h3>
+              <p className="text-xs text-slate-400 mt-0.5">
+                Click any cell to inspect pairwise normalized overlay and divergence.
+              </p>
+            </div>
+            <div className="flex items-center gap-4 text-xs text-slate-400">
+              <span className="text-emerald-400">Direct (+0.35 to +1.00)</span>
+              <span className="text-rose-400">Inverse (-0.35 to -1.00)</span>
+            </div>
+          </div>
+
+          <table className="w-full min-w-[680px] border-collapse text-xs font-mono tabular-nums">
+            <thead>
+              <tr>
+                <th className="p-1.5 text-left text-slate-500 font-medium">Asset</th>
+                {MATRIX_IDS.map((col) => (
+                  <th key={col} className="p-1.5 text-center text-slate-400 font-medium">
+                    {col}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {MATRIX_IDS.map((row) => (
+                <tr key={row} className="border-t border-slate-800/50">
+                  <td className="p-1.5 font-semibold text-slate-200 whitespace-nowrap">{row}</td>
+                  {MATRIX_IDS.map((col) => {
+                    const val = intermarket.matrix[row]?.[col] ?? 0;
+                    const isDiag = row === col;
+                    const isSelected = (pairA === row && pairB === col) || (pairA === col && pairB === row);
+                    return (
+                      <td key={col} className="p-0.5">
+                        <button
+                          disabled={isDiag}
+                          onClick={() => {
+                            setPairA(row);
+                            setPairB(col);
+                          }}
+                          className={`w-full py-1.5 px-1 rounded text-center transition-transform ${cellStyle(
+                            val,
+                            isDiag
+                          )} ${isSelected ? 'ring-1 ring-[var(--accent)]' : ''} ${
+                            !isDiag ? 'hover:brightness-125 cursor-pointer' : 'cursor-default'
+                          }`}
+                        >
+                          {val.toFixed(2)}
+                        </button>
+                      </td>
+                    );
+                  })}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        {/* Pairwise Normalized Overlay Chart */}
+        <div className="xl:col-span-5 min-w-0 border border-[var(--border-hairline)] bg-[var(--bg-surface)] rounded-lg p-5">
+          <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+            <h3 className="text-sm font-display font-semibold text-slate-100">
+              Pairwise Relationship Inspector
+            </h3>
+            <div className="flex flex-wrap gap-1">
+              {QUICK_PAIRS.map((qp) => (
+                <button
+                  key={qp.label}
+                  onClick={() => {
+                    setPairA(qp.a);
+                    setPairB(qp.b);
+                  }}
+                  className={`px-2 py-1 text-[11px] rounded border transition-colors whitespace-nowrap shrink-0 ${
+                    pairA === qp.a && pairB === qp.b
+                      ? 'bg-[var(--accent-soft)] border-[var(--accent-border)] text-[var(--accent-text)]'
+                      : 'bg-[var(--bg-inset)] border-[var(--border-hairline)] text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  {qp.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-3 py-3 border-y border-[var(--border-hairline)] mb-4">
+            <div className="flex items-center gap-2">
+              <select
+                value={pairA}
+                onChange={(e) => setPairA(e.target.value as BenchmarkId)}
+                className="bg-[var(--bg-inset)] border border-[var(--border-strong)] rounded px-2.5 py-1 text-xs font-mono text-[var(--accent-text)]"
+              >
+                {MATRIX_IDS.map((id) => (
+                  <option key={id} value={id}>
+                    {id}
+                  </option>
+                ))}
+              </select>
+              <span className="text-xs text-slate-500">vs</span>
+              <select
+                value={pairB}
+                onChange={(e) => setPairB(e.target.value as BenchmarkId)}
+                className="bg-[var(--bg-inset)] border border-[var(--border-strong)] rounded px-2.5 py-1 text-xs font-mono text-amber-300"
+              >
+                {MATRIX_IDS.map((id) => (
+                  <option key={id} value={id}>
+                    {id}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="flex items-center gap-3 text-xs font-mono">
+              <span
+                className={
+                  relationshipKind === 'DIRECT'
+                    ? 'text-emerald-400 font-semibold'
+                    : relationshipKind === 'INVERSE'
+                      ? 'text-rose-400 font-semibold'
+                      : 'text-slate-400'
+                }
+              >
+                r = {activeCorr >= 0 ? '+' : ''}
+                {activeCorr.toFixed(2)} ({relationshipKind})
+              </span>
+              <button
+                onClick={() => setInvertSecond((v) => !v)}
+                className={`px-2 py-1 rounded border text-[11px] transition-colors whitespace-nowrap shrink-0 ${
+                  invertSecond
+                    ? 'bg-amber-500/20 border-amber-500/40 text-amber-300'
+                    : 'bg-[var(--bg-inset)] border-[var(--border-hairline)] text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                {invertSecond ? `${pairB} Inverted` : `Invert ${pairB}`}
+              </button>
+            </div>
+          </div>
+
+          {/* Normalized Dual-Line SVG Chart */}
+          <div className="bg-[var(--bg-inset)] border border-[var(--border-hairline)] rounded p-3">
+            <svg viewBox="0 0 460 190" className="w-full h-48 overflow-visible">
+              {(() => {
+                const w = 440;
+                const h = 160;
+                const padL = 10;
+                const padT = 14;
+                const span = Math.max(0.05, chartData.max - chartData.min);
+                const toX = (idx: number) => padL + (idx / Math.max(1, chartData.normA.length - 1)) * w;
+                const toY = (val: number) => padT + ((chartData.max - val) / span) * h;
+                const zeroY = toY(0);
+
+                const ptsA = chartData.normA.map((v, i) => `${toX(i).toFixed(1)},${toY(v).toFixed(1)}`).join(' ');
+                const ptsB = chartData.normB.map((v, i) => `${toX(i).toFixed(1)},${toY(v).toFixed(1)}`).join(' ');
+
+                return (
+                  <g>
+                    <line x1={padL} x2={padL + w} y1={zeroY} y2={zeroY} stroke="#1E293B" strokeDasharray="3 3" />
+                    <polyline fill="none" stroke="var(--accent)" strokeWidth={2} points={ptsA} />
+                    <polyline fill="none" stroke="#38BDF8" strokeWidth={2} points={ptsB} />
+                  </g>
+                );
+              })()}
+            </svg>
+            <div className="flex items-center justify-between text-[11px] font-mono text-slate-400 mt-2 pt-2 border-t border-[var(--border-hairline)]">
+              <span className="text-[var(--accent-text)]">
+                ● {pairA}: {assetA.changePct >= 0 ? '+' : ''}
+                {assetA.changePct.toFixed(2)}%
+              </span>
+              <span className="text-sky-400">
+                ● {pairB}
+                {invertSecond ? ' (Inv)' : ''}: {assetB.changePct >= 0 ? '+' : ''}
+                {assetB.changePct.toFixed(2)}%
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Institutional Drivers Table */}
+      <div className="border border-[var(--border-hairline)] bg-[var(--bg-surface)] rounded-lg p-5">
+        <h3 className="text-sm font-display font-semibold text-slate-100 mb-3">
+          Core Intermarket Drivers &amp; Macro Cross-Checks
+        </h3>
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {intermarket.keyRelationships.map((rel) => (
+            <button
+              key={`${rel.pairA}-${rel.pairB}`}
+              onClick={() => {
+                setPairA(rel.pairA);
+                setPairB(rel.pairB);
+              }}
+              className="text-left p-4 rounded-md bg-[var(--bg-inset)] border border-[var(--border-hairline)] hover:border-[var(--border-strong)] transition-colors"
+            >
+              <div className="flex items-center justify-between">
+                <span className="font-mono text-xs font-semibold text-slate-200">
+                  {rel.pairA} / {rel.pairB}
+                </span>
+                <span
+                  className={`flex items-center gap-1 font-mono text-xs font-semibold ${
+                    rel.nature === 'DIRECT'
+                      ? 'text-emerald-400'
+                      : rel.nature === 'INVERSE'
+                        ? 'text-rose-400'
+                        : 'text-slate-400'
+                  }`}
+                >
+                  {rel.nature === 'DIRECT' ? (
+                    <ArrowUpRight className="w-3.5 h-3.5" />
+                  ) : (
+                    <ArrowDownRight className="w-3.5 h-3.5" />
+                  )}
+                  {rel.correlation >= 0 ? '+' : ''}
+                  {rel.correlation.toFixed(2)} · {rel.nature}
+                </span>
+              </div>
+              <p className="text-xs text-slate-400 mt-2 leading-relaxed">{rel.driver}</p>
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+};
+
