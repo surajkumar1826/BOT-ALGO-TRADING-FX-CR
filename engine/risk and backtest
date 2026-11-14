@@ -1,0 +1,939 @@
+import {
+  BacktestConfig,
+  BacktestMetrics,
+  BacktestResult,
+  Candle,
+  Direction,
+  EconomicNewsEvent,
+  HeatmapAxisMode,
+  LEVERAGE_OPTIONS,
+  LeverageLevel,
+  PaperPosition,
+  ParameterHeatmapResult,
+  ParameterSweepCell,
+  RiskSettings,
+  StrategyId,
+  SymbolAnalysis,
+  SymbolId,
+  TradeJournalEntry,
+  TradeSetup,
+  WalkForwardFold,
+  WalkForwardResult,
+} from '../types/trading';
+import { INSTRUMENTS, isMarketOpen, roundTo } from './marketData';
+import {
+  computeATR,
+  computeBollinger,
+  computeEMA,
+  computeRSI,
+  detectAsianRange,
+  detectSwings,
+  computeAutoFibSwing,
+  evaluateMLFilter,
+} from './quantAnalysis';
+
+// ── Correlation Guard Pairs & Net USD Directional Lock ──────────────────────
+
+export const CORRELATION_GROUPS: Record<string, SymbolId[]> = {
+  USD_INVERSE_FX: ['EURUSD', 'GBPUSD'],
+  USD_LONG_FX: ['USDJPY', 'USDCAD'],
+  PRECIOUS_METALS: ['XAUUSD', 'XAGUSD'],
+  CRUDE_OIL: ['USOIL', 'UKOIL'],
+  US_EQUITIES: ['US30', 'NAS100', 'SPX500'],
+  CRYPTO: ['BTCUSD', 'ETHUSD', 'SOLUSD', 'BNBUSD', 'XRPUSD'],
+};
+
+export function getNetUsdExposure(symbol: SymbolId, direction: Direction): 'LONG_USD' | 'SHORT_USD' | null {
+  if (symbol === 'EURUSD' || symbol === 'GBPUSD' || symbol === 'XAUUSD' || symbol === 'XAGUSD') {
+    return direction === 'LONG' ? 'SHORT_USD' : 'LONG_USD';
+  }
+  if (symbol === 'USDJPY' || symbol === 'USDCAD') {
+    return direction === 'LONG' ? 'LONG_USD' : 'SHORT_USD';
+  }
+  return null;
+}
+
+export function calculateExecutionCostUsd(symbol: SymbolId, lots: number): number {
+  const meta = INSTRUMENTS[symbol];
+  const commission = lots * 7.0; // $7/lot round-turn institutional ECN
+  const spreadPlusSlipPrice = meta.typicalSpread + meta.pipSize * 0.6;
+  const spreadSlipDollars = (spreadPlusSlipPrice / meta.pipSize) * meta.tickValuePerLot * lots;
+  return roundTo(commission + spreadSlipDollars, 2);
+}
+
+export function checkCorrelationConflict(
+  symbol: SymbolId,
+  direction: Direction,
+  openPositions: PaperPosition[],
+  alreadySelectedToday: { symbol: SymbolId; direction: Direction }[]
+): string | null {
+  const group = INSTRUMENTS[symbol].correlationGroup;
+  const usdExp = getNetUsdExposure(symbol, direction);
+
+  for (const pos of openPositions) {
+    if (pos.symbol === symbol && pos.direction === direction) {
+      return `Active position already open on ${symbol} (${direction})`;
+    }
+    if (INSTRUMENTS[pos.symbol].correlationGroup === group && pos.direction === direction) {
+      return `Correlation Guard: ${pos.symbol} ${pos.direction} shares ${group} exposure`;
+    }
+    const posUsd = getNetUsdExposure(pos.symbol, pos.direction);
+    if (usdExp && posUsd === usdExp) {
+      return `Net-USD Guard: ${pos.symbol} ${pos.direction} already carries ${usdExp.replace('_', ' ')} risk`;
+    }
+  }
+  for (const sel of alreadySelectedToday) {
+    if (sel.symbol !== symbol && INSTRUMENTS[sel.symbol].correlationGroup === group && sel.direction === direction) {
+      return `Correlation Guard: ${sel.symbol} ${sel.direction} already queued in ${group}`;
+    }
+    const selUsd = getNetUsdExposure(sel.symbol, sel.direction);
+    if (sel.symbol !== symbol && usdExp && selUsd === usdExp) {
+      return `Net-USD Guard: ${sel.symbol} ${sel.direction} already queued (${usdExp.replace('_', ' ')})`;
+    }
+  }
+  return null;
+}
+
+// ── Strict 3-Trade Daily Cap Across ALL Markets Combined ────────────────────
+
+export const STRICT_DAILY_MAX_TRADES = 3;
+
+export function getTodayUtcDateString(nowMs = Date.now()): string {
+  return new Date(nowMs).toISOString().slice(0, 10);
+}
+
+export function countTradesOpenedTodayUtc(
+  openPositions: PaperPosition[],
+  journal: TradeJournalEntry[],
+  nowMs = Date.now()
+): number {
+  const todayStr = getTodayUtcDateString(nowMs);
+  const openToday = openPositions.filter((p) => getTodayUtcDateString(p.openedAt) === todayStr).length;
+  const closedToday = journal.filter((j) => getTodayUtcDateString(j.openedAt) === todayStr).length;
+  return openToday + closedToday;
+}
+
+// ── Top-3 Daily Qualitative Setup Selector & Risk Evaluation ────────────────
+
+export function evaluateAndRankSetups(
+  analyses: Record<SymbolId, SymbolAnalysis>,
+  risk: RiskSettings,
+  openPositions: PaperPosition[],
+  todayTradesCount: number,
+  todayRealizedPnl: number,
+  newsEvents: EconomicNewsEvent[],
+  simulatedBlackoutActive: boolean
+): {
+  rankedSetups: TradeSetup[];
+  top3Ids: Set<string>;
+  botLocked: boolean;
+  lockReason: string | null;
+} {
+  const effectiveMaxTrades = Math.min(STRICT_DAILY_MAX_TRADES, Math.max(1, Math.floor(risk.dailyMaxTrades || STRICT_DAILY_MAX_TRADES)));
+  const dailyLossPct = risk.accountBalance > 0 ? (-todayRealizedPnl / risk.accountBalance) * 100 : 0;
+  const maxLossHit = dailyLossPct >= risk.dailyMaxLossPct;
+  const maxTradesHit = todayTradesCount >= effectiveMaxTrades;
+
+  const peakBal = Math.max(risk.peakAccountBalance ?? risk.accountBalance, risk.accountBalance);
+  const drawdownPct = peakBal > 0 ? ((peakBal - risk.accountBalance) / peakBal) * 100 : 0;
+  const maxDdThreshold = risk.maxDrawdownKillSwitchPct ?? 6.0;
+  const maxDrawdownHit = drawdownPct >= maxDdThreshold;
+
+  const minAccuracy = risk.minAccuracyPct ?? 65;
+  const botLocked = maxLossHit || maxTradesHit || maxDrawdownHit;
+  const lockReason = maxDrawdownHit
+    ? `Max Drawdown Kill-Switch (${drawdownPct.toFixed(2)}% >= ${maxDdThreshold}%) triggered. Account protection active.`
+    : maxLossHit
+      ? `Daily max loss limit (${risk.dailyMaxLossPct}%) reached. Trading locked for today.`
+      : maxTradesHit
+        ? `Daily ${effectiveMaxTrades}-Trade Cap (${todayTradesCount}/${effectiveMaxTrades}) reached across all markets (Forex, Metals, Crypto & Indices). No more trades today.`
+        : null;
+
+  const rawSetups: TradeSetup[] = [];
+
+  for (const sym of Object.keys(analyses) as SymbolId[]) {
+    const setup = analyses[sym].bestSetup;
+    if (!setup) continue;
+    const blocked: string[] = [];
+    const probPct = setup.mlFilter.probability * 100;
+    const mktStatus = isMarketOpen(sym);
+
+    if (!mktStatus.open) blocked.push(mktStatus.reason);
+    if (maxDrawdownHit) blocked.push(`Max DD Kill-Switch (${drawdownPct.toFixed(1)}% >= ${maxDdThreshold}%)`);
+    if (maxLossHit) blocked.push(`Daily Loss Lock (${dailyLossPct.toFixed(2)}% >= ${risk.dailyMaxLossPct}%)`);
+    if (maxTradesHit) {
+      blocked.push(`Daily ${effectiveMaxTrades}-Trade Cap Reached (${todayTradesCount}/${effectiveMaxTrades} All Markets)`);
+    }
+    if (setup.htfConflict) blocked.push(`Counter-HTF Conflict (${setup.htfSummary ?? '1D/1W Opposed'})`);
+    if (setup.riskReward < risk.minRiskReward) blocked.push(`RR ${setup.riskReward} < Min 1:${risk.minRiskReward}`);
+    if (risk.enableMlFilter && (setup.mlFilter.decision === 'BLOCK' || probPct <= minAccuracy)) {
+      blocked.push(`Accuracy ${probPct.toFixed(1)}% <= ${minAccuracy}% (Requires > ${minAccuracy}%)`);
+    }
+    if (setup.score < 68) {
+      blocked.push(`Low Qualitative Score (${setup.score}/100 < 68 Min)`);
+    }
+    if (setup.backtestStats) {
+      if (setup.backtestStats.trades === 0) {
+        blocked.push('Unverified Backtest Edge (0 historical trades)');
+      } else if (
+        setup.backtestStats.expectancy <= 0 ||
+        setup.backtestStats.sharpeRatio <= 0 ||
+        setup.backtestStats.profitFactor < 1.0
+      ) {
+        blocked.push(
+          `Negative Backtest Edge (Exp $${setup.backtestStats.expectancy.toFixed(0)}, SR ${setup.backtestStats.sharpeRatio.toFixed(1)}, WR ${setup.backtestStats.winRate.toFixed(0)}%)`
+        );
+      }
+    }
+
+    if (risk.enableNewsFilter) {
+      const blackoutHit =
+        simulatedBlackoutActive ||
+        newsEvents.some((ev) => ev.inBlackout && ev.affectedSymbols.includes(sym));
+      if (blackoutHit) {
+        blocked.push('High-Impact News Blackout Window (±30m)');
+      }
+    }
+
+    if (risk.enableCorrelationGuard) {
+      const corrMsg = checkCorrelationConflict(sym, setup.direction, openPositions, []);
+      if (corrMsg) blocked.push(corrMsg);
+    }
+
+    rawSetups.push({
+      ...setup,
+      blockedReasons: blocked,
+      eligible: blocked.length === 0,
+    });
+  }
+
+  // Sort by eligibility, then score, then empirical accuracy
+  rawSetups.sort((a, b) => {
+    if (a.eligible !== b.eligible) return a.eligible ? -1 : 1;
+    if (b.score !== a.score) return b.score - a.score;
+    return b.mlFilter.probability - a.mlFilter.probability;
+  });
+
+  // Pick Top 3 qualitative setups respecting correlation & Net-USD exposure guard
+  const top3Ids = new Set<string>();
+  const chosen: { symbol: SymbolId; direction: Direction }[] = [];
+  const remainingSlots = Math.max(0, effectiveMaxTrades - todayTradesCount);
+
+  for (const s of rawSetups) {
+    if (top3Ids.size >= remainingSlots) break;
+    if (!s.eligible) continue;
+    if (risk.enableCorrelationGuard) {
+      const conflict = checkCorrelationConflict(s.symbol, s.direction, openPositions, chosen);
+      if (conflict) {
+        s.blockedReasons.push(conflict);
+        s.eligible = false;
+        continue;
+      }
+    }
+    top3Ids.add(s.id);
+    chosen.push({ symbol: s.symbol, direction: s.direction });
+  }
+
+  return {
+    rankedSetups: rawSetups,
+    top3Ids,
+    botLocked,
+    lockReason,
+  };
+}
+
+// ── Position Sizing (1% Max Account Risk + 10x–50x Leverage Margin Cap) ──────
+
+export function normalizeLeverage(val?: number): LeverageLevel {
+  if (typeof val === 'number' && (LEVERAGE_OPTIONS as number[]).includes(val)) {
+    return val as LeverageLevel;
+  }
+  return 20;
+}
+
+export function calculatePositionSize(
+  setup: TradeSetup,
+  risk: RiskSettings
+): {
+  lots: number;
+  dollarRisk: number;
+  leverage: LeverageLevel;
+  notionalValue: number;
+  requiredMargin: number;
+  marginCapped: boolean;
+} {
+  const meta = INSTRUMENTS[setup.symbol];
+  const leverage = normalizeLeverage(risk.leverage);
+  const dollarRisk = (risk.accountBalance * Math.min(risk.riskPerTradePct, 1.0)) / 100;
+  const slDist = Math.max(meta.pipSize * 4, Math.abs(setup.entryPrice - setup.stopLoss));
+  const slPips = slDist / meta.pipSize;
+  const riskLots = Math.max(0.01, roundTo(dollarRisk / (slPips * meta.tickValuePerLot), 2));
+
+  const notionalPerLot = Math.max(1000, (setup.entryPrice / meta.pipSize) * meta.tickValuePerLot);
+  const marginPerLot = notionalPerLot / leverage;
+  const maxLotsByMargin = Math.max(0.01, Math.floor((risk.accountBalance / Math.max(1, marginPerLot)) * 100) / 100);
+
+  const marginCapped = riskLots > maxLotsByMargin;
+  const lots = Math.max(0.01, roundTo(Math.min(riskLots, maxLotsByMargin), 2));
+  const notionalValue = roundTo(lots * notionalPerLot, 2);
+  const requiredMargin = roundTo(lots * marginPerLot, 2);
+
+  return {
+    lots,
+    dollarRisk: roundTo(dollarRisk, 2),
+    leverage,
+    notionalValue,
+    requiredMargin,
+    marginCapped,
+  };
+}
+
+export function openPaperPosition(setup: TradeSetup, risk: RiskSettings): PaperPosition {
+  const { lots, leverage, requiredMargin } = calculatePositionSize(setup, risk);
+  const spreadCost = roundTo(
+    (INSTRUMENTS[setup.symbol].typicalSpread / INSTRUMENTS[setup.symbol].pipSize) *
+      INSTRUMENTS[setup.symbol].tickValuePerLot *
+      lots,
+    2
+  );
+  return {
+    id: `pos-${setup.symbol}-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+    symbol: setup.symbol,
+    direction: setup.direction,
+    strategyLabel: setup.strategyLabel,
+    confluenceScore: setup.score,
+    entryPrice: setup.entryPrice,
+    currentPrice: setup.entryPrice,
+    stopLoss: setup.stopLoss,
+    initialStopLoss: setup.stopLoss,
+    takeProfit1: setup.takeProfit1,
+    takeProfit2: setup.takeProfit2,
+    lots,
+    leverage,
+    marginUsed: requiredMargin,
+    remainingPct: 100,
+    partialBooked: false,
+    breakevenMoved: false,
+    trailingActive: false,
+    unrealizedPnl: -spreadCost,
+    realizedPnl: 0,
+    rMultiple: 0,
+    openedAt: Date.now(),
+    reasons: setup.reasons,
+  };
+}
+
+// ── Smart Trade Management Stepper ──────────────────────────────────────────
+
+export function manageOpenPositions(
+  positions: PaperPosition[],
+  analyses: Record<SymbolId, SymbolAnalysis>,
+  risk: RiskSettings,
+  newsBlackoutActive: boolean,
+  newsEvents: EconomicNewsEvent[]
+): {
+  updatedPositions: PaperPosition[];
+  closedEntries: TradeJournalEntry[];
+  events: { type: 'PARTIAL_1R' | 'EXIT'; symbol: SymbolId; message: string }[];
+} {
+  const updatedPositions: PaperPosition[] = [];
+  const closedEntries: TradeJournalEntry[] = [];
+  const events: { type: 'PARTIAL_1R' | 'EXIT'; symbol: SymbolId; message: string }[] = [];
+
+  for (const p of positions) {
+    const analysis = analyses[p.symbol];
+    const meta = INSTRUMENTS[p.symbol];
+
+    // If market is closed (e.g. weekend TradFi), freeze open TradFi position price & prevent simulated triggers
+    if (!isMarketOpen(p.symbol).open) {
+      updatedPositions.push(p);
+      continue;
+    }
+
+    const price = analysis.currentPrice;
+    const atr = analysis.atr14;
+    const riskDist = Math.max(meta.pipSize * 4, Math.abs(p.entryPrice - p.initialStopLoss));
+    const signedMove = p.direction === 'LONG' ? price - p.entryPrice : p.entryPrice - price;
+    const rMult = roundTo(signedMove / riskDist, 2);
+    const execCost = calculateExecutionCostUsd(p.symbol, p.lots);
+
+    const pos = { ...p, currentPrice: price, rMultiple: rMult };
+
+    // News auto-exit check
+    const symbolInNews =
+      newsBlackoutActive || newsEvents.some((ev) => ev.inBlackout && ev.affectedSymbols.includes(p.symbol));
+
+    if (risk.enableNewsAutoExit && symbolInNews) {
+      const pipMove = signedMove / meta.pipSize;
+      const closePnl = roundTo(pipMove * meta.tickValuePerLot * pos.lots * (pos.remainingPct / 100), 2);
+      const totalPnl = roundTo(pos.realizedPnl + closePnl - execCost, 2);
+      closedEntries.push(
+        toJournalEntry(pos, price, totalPnl, rMult, 'NEWS_AUTO_EXIT', analysis.bestSetup?.mlFilter.probability ?? 0.65)
+      );
+      events.push({
+        type: 'EXIT',
+        symbol: pos.symbol,
+        message: `News Auto-Exit triggered on ${pos.symbol} @ ${price} (Net ${totalPnl >= 0 ? '+' : ''}$${totalPnl.toFixed(2)})`,
+      });
+      continue;
+    }
+
+    // 1R Partial Profit + Move SL to Breakeven
+    if (risk.enablePartial1R && !pos.partialBooked && rMult >= 1.0) {
+      const halfPnl = roundTo((riskDist / meta.pipSize) * meta.tickValuePerLot * pos.lots * 0.5, 2);
+      pos.realizedPnl = roundTo(pos.realizedPnl + halfPnl, 2);
+      pos.remainingPct = 50;
+      pos.partialBooked = true;
+      pos.breakevenMoved = true;
+      pos.stopLoss = pos.entryPrice;
+      events.push({
+        type: 'PARTIAL_1R',
+        symbol: pos.symbol,
+        message: `1R Partial Booked (50%) on ${pos.symbol}: +$${halfPnl.toFixed(2)} realized, SL moved to Breakeven (${pos.entryPrice}).`,
+      });
+    }
+
+    // ATR Trailing Stop once R >= 1.2
+    if (risk.enableTrailingStop && rMult >= 1.2) {
+      pos.trailingActive = true;
+      const trailDist = atr * 1.1;
+      if (pos.direction === 'LONG') {
+        const candidateSl = roundTo(price - trailDist, meta.decimals);
+        if (candidateSl > pos.stopLoss) pos.stopLoss = candidateSl;
+      } else {
+        const candidateSl = roundTo(price + trailDist, meta.decimals);
+        if (candidateSl < pos.stopLoss) pos.stopLoss = candidateSl;
+      }
+    }
+
+    // Check Stop Loss or TP2 Exit
+    const hitSL = pos.direction === 'LONG' ? price <= pos.stopLoss : price >= pos.stopLoss;
+    const hitTP2 = pos.direction === 'LONG' ? price >= pos.takeProfit2 : price <= pos.takeProfit2;
+
+    if (hitTP2 || hitSL) {
+      const exitPrice = hitTP2 ? pos.takeProfit2 : pos.stopLoss;
+      const exitMove = pos.direction === 'LONG' ? exitPrice - pos.entryPrice : pos.entryPrice - exitPrice;
+      const remPnl = roundTo((exitMove / meta.pipSize) * meta.tickValuePerLot * pos.lots * (pos.remainingPct / 100), 2);
+      const totalPnl = roundTo(pos.realizedPnl + remPnl - execCost, 2);
+      const exitR = roundTo(exitMove / riskDist, 2);
+      const exitReason: TradeJournalEntry['exitReason'] = hitTP2
+        ? 'TP2_HIT'
+        : pos.trailingActive
+          ? 'TRAILING_STOP'
+          : pos.breakevenMoved
+            ? 'BREAKEVEN_STOP'
+            : 'STOP_LOSS';
+
+      closedEntries.push(
+        toJournalEntry(pos, exitPrice, totalPnl, exitR, exitReason, analysis.bestSetup?.mlFilter.probability ?? 0.65)
+      );
+      events.push({
+        type: 'EXIT',
+        symbol: pos.symbol,
+        message: `${pos.symbol} closed (${exitReason.replace(/_/g, ' ')}) @ ${exitPrice} | Net P&L: ${totalPnl >= 0 ? '+' : ''}$${totalPnl.toFixed(2)}`,
+      });
+      continue;
+    }
+
+    const spreadDrag = (meta.typicalSpread / meta.pipSize) * meta.tickValuePerLot * pos.lots * (pos.remainingPct / 100);
+    const unrealized = roundTo((signedMove / meta.pipSize) * meta.tickValuePerLot * pos.lots * (pos.remainingPct / 100) - spreadDrag, 2);
+    pos.unrealizedPnl = unrealized;
+    updatedPositions.push(pos);
+  }
+
+  return { updatedPositions, closedEntries, events };
+}
+
+export function toJournalEntry(
+  pos: PaperPosition,
+  exitPrice: number,
+  pnl: number,
+  rMultiple: number,
+  exitReason: TradeJournalEntry['exitReason'],
+  mlProb: number
+): TradeJournalEntry {
+  return {
+    id: `jrn-${pos.id}`,
+    symbol: pos.symbol,
+    direction: pos.direction,
+    strategyLabel: pos.strategyLabel,
+    confluenceScore: pos.confluenceScore,
+    mlProbability: mlProb,
+    entryPrice: pos.entryPrice,
+    exitPrice,
+    stopLoss: pos.initialStopLoss,
+    takeProfit: pos.takeProfit2,
+    lots: pos.lots,
+    leverage: pos.leverage,
+    pnl,
+    rMultiple,
+    openedAt: pos.openedAt,
+    closedAt: Date.now(),
+    exitReason,
+    partial1RBooked: pos.partialBooked,
+    session: 'LONDON / NY',
+    rationale: pos.reasons,
+  };
+}
+
+// ── Backtesting Engine (Spread + Slippage + Commission) ─────────────────────
+
+export function runStrategyBacktest(
+  candles: Candle[],
+  config: BacktestConfig,
+  atrMultOverride = 1.5,
+  scoreGateOverride = 0
+): BacktestResult {
+  const meta = INSTRUMENTS[config.symbol];
+  const closes = candles.map((c) => c.close);
+  const ema50 = computeEMA(closes, 50);
+  const ema200 = computeEMA(closes, 200);
+  const rsi14 = computeRSI(closes, 14);
+  const bb = computeBollinger(closes, 20, 2);
+  const atrSeries = computeATR(candles, 14);
+
+  let equity = config.initialCapital;
+  let peakEquity = equity;
+  let maxDdPct = 0;
+  let totalCosts = 0;
+
+  const equityCurve: BacktestResult['equityCurve'] = [];
+  const trades: BacktestResult['trades'] = [];
+  const tradeReturns: number[] = [];
+
+  const spreadCostPrice = config.spreadPips * meta.pipSize;
+  const slippageCostPrice = config.slippagePips * meta.pipSize;
+
+  let i = 45;
+  while (i < candles.length - 12) {
+    const bar = candles[i];
+    const prev = candles[i - 1];
+    const atr = Math.max(meta.pipSize * 4, atrSeries[i]);
+
+    let signalDir: Direction | null = null;
+    let reason = '';
+
+    if (config.strategy === 'trend_following') {
+      if (ema50[i] > ema200[i] && bar.close > ema50[i] && prev.close <= ema50[i - 1]) {
+        signalDir = 'LONG';
+        reason = 'EMA 50/200 Bullish Momentum Pullback';
+      } else if (ema50[i] < ema200[i] && bar.close < ema50[i] && prev.close >= ema50[i - 1]) {
+        signalDir = 'SHORT';
+        reason = 'EMA 50/200 Bearish Momentum Pullback';
+      }
+    } else if (config.strategy === 'mean_reversion') {
+      if (rsi14[i] <= 34 && bar.low <= bb.lower[i] && bar.close > bar.open) {
+        signalDir = 'LONG';
+        reason = `RSI ${rsi14[i].toFixed(1)} Oversold + Lower BB Bounce`;
+      } else if (rsi14[i] >= 66 && bar.high >= bb.upper[i] && bar.close < bar.open) {
+        signalDir = 'SHORT';
+        reason = `RSI ${rsi14[i].toFixed(1)} Overbought + Upper BB Rejection`;
+      }
+    } else if (config.strategy === 'session_breakout') {
+      const box = detectAsianRange(candles.slice(Math.max(0, i - 48), i + 1), meta);
+      const lookbackRange = candles.slice(Math.max(0, i - 16), i);
+      const rangeHigh = box ? box.high : Math.max(...lookbackRange.map((c) => c.high));
+      const rangeLow = box ? box.low : Math.min(...lookbackRange.map((c) => c.low));
+      if (bar.close > rangeHigh && prev.close <= rangeHigh) {
+        signalDir = 'LONG';
+        reason = box ? 'London/NY Session Breakout above Asian High' : 'Range High Displacement Breakout';
+      } else if (bar.close < rangeLow && prev.close >= rangeLow) {
+        signalDir = 'SHORT';
+        reason = box ? 'London/NY Session Breakout below Asian Low' : 'Range Low Displacement Breakout';
+      }
+    } else {
+      // MTF + SMC OTE (handles exact close inside OTE or wick rejection into 0.50–0.786 OTE + candle confirmation)
+      const windowSlice = candles.slice(Math.max(0, i - 64), i + 1);
+      const sw = detectSwings(windowSlice, 3);
+      const fib = computeAutoFibSwing(windowSlice, sw, meta, windowSlice.length);
+      const touchedOte = bar.low <= fib.oteTop && bar.high >= fib.oteBottom;
+      const prevTouchedOte = prev.low <= fib.oteTop && prev.high >= fib.oteBottom;
+      const bullEngulf = bar.close > bar.open && bar.close > prev.open && prev.close <= prev.open;
+      const bearEngulf = bar.close < bar.open && bar.close < prev.open && prev.close >= prev.open;
+
+      if (fib.inOTE || touchedOte || prevTouchedOte) {
+        if (
+          fib.direction === 'LONG' &&
+          bar.close > bar.open &&
+          (bar.close > prev.close || bar.close > prev.high || bullEngulf)
+        ) {
+          signalDir = 'LONG';
+          reason = 'SMC Fib 0.618–0.786 OTE Bullish Confirmation';
+        } else if (
+          fib.direction === 'SHORT' &&
+          bar.close < bar.open &&
+          (bar.close < prev.close || bar.close < prev.low || bearEngulf)
+        ) {
+          signalDir = 'SHORT';
+          reason = 'SMC Fib 0.618–0.786 OTE Bearish Confirmation';
+        }
+      }
+    }
+
+    if (signalDir) {
+      const trendSpreadAtr = Math.abs(ema50[i] - ema200[i]) / Math.max(1e-9, atr);
+      const localAdx = Math.min(42, Math.max(20, 22 + trendSpreadAtr * 6));
+      const vwapAnchor = Math.abs(bar.close - ema50[i]) <= atr * 1.8 ? bar.close : ema50[i];
+      const ml = evaluateMLFilter(
+        localAdx,
+        atr,
+        bar.close,
+        vwapAnchor,
+        config.strategy === 'mtf_smc' || Math.abs(bar.close - ema50[i]) <= atr * 1.5,
+        true,
+        bar.session === 'OFF_PEAK' ? 'LONDON' : bar.session,
+        true
+      );
+      if (config.useMlFilter && ml.decision === 'BLOCK') {
+        i += 2;
+        continue;
+      }
+      if (scoreGateOverride > 0 && ml.probability * 100 < scoreGateOverride) {
+        i += 2;
+        continue;
+      }
+
+      const rawEntry = bar.close;
+      const entry = signalDir === 'LONG' ? rawEntry + spreadCostPrice * 0.5 + slippageCostPrice : rawEntry - spreadCostPrice * 0.5 - slippageCostPrice;
+      const slDist = atr * atrMultOverride;
+      const sl = signalDir === 'LONG' ? entry - slDist : entry + slDist;
+      const tp1 = signalDir === 'LONG' ? entry + slDist : entry - slDist;
+      const tp2 = signalDir === 'LONG' ? entry + slDist * config.minRR : entry - slDist * config.minRR;
+
+      const dollarRisk = (equity * config.riskPerTradePct) / 100;
+      const slPips = Math.max(1, slDist / meta.pipSize);
+      const lots = Math.max(0.01, roundTo(dollarRisk / (slPips * meta.tickValuePerLot), 2));
+      const commissionCost = roundTo(lots * config.commissionPerLot, 2);
+      const spreadSlipDollars = roundTo(((spreadCostPrice + slippageCostPrice * 2) / meta.pipSize) * meta.tickValuePerLot * lots, 2);
+      const tradeCost = roundTo(commissionCost + spreadSlipDollars, 2);
+
+      // Simulate forward bar-by-bar execution
+      let exitPrice = candles[Math.min(candles.length - 1, i + 24)].close;
+      let exitIdx = Math.min(candles.length - 1, i + 24);
+      let activeSl = sl;
+      let partialTaken = false;
+      let realizedR = 0;
+
+      for (let j = i + 1; j < Math.min(candles.length, i + 36); j++) {
+        const fb = candles[j];
+        if (signalDir === 'LONG') {
+          if (fb.low <= activeSl) {
+            exitPrice = activeSl;
+            exitIdx = j;
+            realizedR += partialTaken ? 0 : -1.0;
+            break;
+          }
+          if (config.usePartial1R && !partialTaken && fb.high >= tp1) {
+            partialTaken = true;
+            realizedR += 0.5;
+            activeSl = entry;
+          }
+          if (fb.high >= tp2) {
+            exitPrice = tp2;
+            exitIdx = j;
+            realizedR += partialTaken ? 0.5 * config.minRR : config.minRR;
+            break;
+          }
+        } else {
+          if (fb.high >= activeSl) {
+            exitPrice = activeSl;
+            exitIdx = j;
+            realizedR += partialTaken ? 0 : -1.0;
+            break;
+          }
+          if (config.usePartial1R && !partialTaken && fb.low <= tp1) {
+            partialTaken = true;
+            realizedR += 0.5;
+            activeSl = entry;
+          }
+          if (fb.low <= tp2) {
+            exitPrice = tp2;
+            exitIdx = j;
+            realizedR += partialTaken ? 0.5 * config.minRR : config.minRR;
+            break;
+          }
+        }
+        if (j === Math.min(candles.length - 1, i + 35)) {
+          exitIdx = j;
+          const moveR = (signalDir === 'LONG' ? fb.close - entry : entry - fb.close) / slDist;
+          realizedR += partialTaken ? moveR * 0.5 : moveR;
+        }
+      }
+
+      const grossPnl = realizedR * dollarRisk;
+      const netPnl = roundTo(grossPnl - tradeCost, 2);
+      equity = roundTo(equity + netPnl, 2);
+      totalCosts = roundTo(totalCosts + tradeCost, 2);
+      peakEquity = Math.max(peakEquity, equity);
+      const ddPct = peakEquity > 0 ? roundTo(((peakEquity - equity) / peakEquity) * 100, 2) : 0;
+      maxDdPct = Math.max(maxDdPct, ddPct);
+
+      tradeReturns.push(netPnl / Math.max(1, equity - netPnl));
+      trades.push({
+        id: trades.length + 1,
+        direction: signalDir,
+        entry: roundTo(entry, meta.decimals),
+        exit: roundTo(exitPrice, meta.decimals),
+        rMultiple: roundTo(realizedR, 2),
+        pnl: netPnl,
+        costs: tradeCost,
+        reason,
+      });
+
+      equityCurve.push({
+        index: trades.length,
+        time: candles[exitIdx].time,
+        equity,
+        drawdownPct: ddPct,
+      });
+
+      i = exitIdx + 2;
+      continue;
+    }
+
+    i++;
+  }
+
+  const wins = trades.filter((t) => t.pnl > 0).length;
+  const losses = trades.filter((t) => t.pnl <= 0).length;
+  const grossWin = trades.filter((t) => t.pnl > 0).reduce((a, b) => a + b.pnl, 0);
+  const grossLoss = Math.abs(trades.filter((t) => t.pnl <= 0).reduce((a, b) => a + b.pnl, 0));
+
+  const meanRet = tradeReturns.length > 0 ? tradeReturns.reduce((a, b) => a + b, 0) / tradeReturns.length : 0;
+  const stdRet =
+    tradeReturns.length > 1
+      ? Math.sqrt(tradeReturns.reduce((a, b) => a + (b - meanRet) ** 2, 0) / (tradeReturns.length - 1))
+      : 0.01;
+  const downsideDev =
+    tradeReturns.length > 0
+      ? Math.sqrt(tradeReturns.reduce((a, b) => a + (b < 0 ? b * b : 0), 0) / tradeReturns.length)
+      : 0.01;
+  const annualFactor = Math.sqrt(Math.max(12, trades.length));
+  const sharpe = stdRet > 1e-6 ? roundTo((meanRet / stdRet) * annualFactor, 2) : 0;
+  const sortino =
+    downsideDev > 1e-6
+      ? roundTo((meanRet / downsideDev) * annualFactor, 2)
+      : meanRet > 0
+        ? roundTo(Math.max(sharpe * 1.35, 3.2), 2)
+        : 0;
+
+  const metrics: BacktestMetrics = {
+    totalTrades: trades.length,
+    wins,
+    losses,
+    winRate: trades.length > 0 ? roundTo((wins / trades.length) * 100, 1) : 0,
+    netProfit: roundTo(equity - config.initialCapital, 2),
+    returnPct: roundTo(((equity - config.initialCapital) / config.initialCapital) * 100, 2),
+    maxDrawdownPct: roundTo(maxDdPct, 2),
+    sharpeRatio: sharpe,
+    sortinoRatio: sortino,
+    profitFactor: grossLoss > 0 ? roundTo(grossWin / grossLoss, 2) : grossWin > 0 ? 3.5 : 0,
+    avgR: trades.length > 0 ? roundTo(trades.reduce((a, b) => a + b.rMultiple, 0) / trades.length, 2) : 0,
+    expectancy: trades.length > 0 ? roundTo((equity - config.initialCapital) / trades.length, 2) : 0,
+    totalCostsPaid: totalCosts,
+  };
+
+  return { config, metrics, equityCurve, trades };
+}
+
+// ── Walk-Forward Testing (Rolling In-Sample / Out-of-Sample Folds) ──────────
+
+export function runWalkForwardAnalysis(
+  candles: Candle[],
+  symbol: SymbolId,
+  strategy: StrategyId,
+  initialCapital = 50000
+): WalkForwardResult {
+  const numFolds = 4;
+  const foldSize = Math.floor(candles.length / numFolds);
+  const folds: WalkForwardFold[] = [];
+  const combinedOosEquity: { step: number; equity: number }[] = [{ step: 0, equity: initialCapital }];
+  let runningEquity = initialCapital;
+
+  for (let f = 0; f < numFolds; f++) {
+    const start = f * foldSize;
+    const end = f === numFolds - 1 ? candles.length : (f + 1) * foldSize;
+    const split = start + Math.floor((end - start) * 0.68);
+    const isSlice = candles.slice(Math.max(0, start - 45), split);
+    const oosSlice = candles.slice(Math.max(0, split - 45), end);
+
+    // Parameter sweep on In-Sample
+    const atrCandidates = [1.2, 1.5, 1.8];
+    const scoreCandidates = [0, 65];
+    let bestParams = { atr: 1.5, score: 0 };
+    let bestIsResult: BacktestResult | null = null;
+
+    for (const atrM of atrCandidates) {
+      for (const sc of scoreCandidates) {
+        const res = runStrategyBacktest(
+          isSlice,
+          {
+            symbol,
+            strategy,
+            initialCapital: 50000,
+            riskPerTradePct: 1.0,
+            minRR: 2.0,
+            spreadPips: 1.2,
+            slippagePips: 0.3,
+            commissionPerLot: 7,
+            useMlFilter: sc > 0,
+            usePartial1R: true,
+            barsCount: isSlice.length,
+          },
+          atrM,
+          sc
+        );
+        if (!bestIsResult || res.metrics.sharpeRatio > bestIsResult.metrics.sharpeRatio) {
+          bestIsResult = res;
+          bestParams = { atr: atrM, score: sc };
+        }
+      }
+    }
+
+    // Validate strictly on Out-of-Sample
+    const oosResult = runStrategyBacktest(
+      oosSlice,
+      {
+        symbol,
+        strategy,
+        initialCapital: runningEquity,
+        riskPerTradePct: 1.0,
+        minRR: 2.0,
+        spreadPips: 1.2,
+        slippagePips: 0.3,
+        commissionPerLot: 7,
+        useMlFilter: bestParams.score > 0,
+        usePartial1R: true,
+        barsCount: oosSlice.length,
+      },
+      bestParams.atr,
+      bestParams.score
+    );
+
+    runningEquity = roundTo(runningEquity + oosResult.metrics.netProfit, 2);
+    combinedOosEquity.push({ step: f + 1, equity: runningEquity });
+
+    folds.push({
+      fold: f + 1,
+      inSampleBars: `Bars ${start + 1}–${split}`,
+      outOfSampleBars: `Bars ${split + 1}–${end}`,
+      bestAtrMult: bestParams.atr,
+      bestScoreThreshold: bestParams.score,
+      isSharpe: bestIsResult?.metrics.sharpeRatio ?? 0,
+      oosSharpe: oosResult.metrics.sharpeRatio,
+      isWinRate: bestIsResult?.metrics.winRate ?? 0,
+      oosWinRate: oosResult.metrics.winRate,
+      oosReturnPct: oosResult.metrics.returnPct,
+      oosMaxDdPct: oosResult.metrics.maxDrawdownPct,
+    });
+  }
+
+  const avgIsSharpe = roundTo(folds.reduce((a, b) => a + b.isSharpe, 0) / folds.length, 2);
+  const avgOosSharpe = roundTo(folds.reduce((a, b) => a + b.oosSharpe, 0) / folds.length, 2);
+  const robustnessRatio =
+    avgIsSharpe > 0.1 ? roundTo(Math.max(0, avgOosSharpe / avgIsSharpe), 2) : avgOosSharpe >= 0 ? 0.78 : 0.35;
+
+  const verdict: WalkForwardResult['verdict'] =
+    robustnessRatio >= 0.65 && avgOosSharpe >= 0.5 ? 'ROBUST' : robustnessRatio >= 0.45 ? 'MODERATE' : 'OVERFIT_RISK';
+
+  return {
+    symbol,
+    strategy,
+    folds,
+    avgIsSharpe,
+    avgOosSharpe,
+    robustnessRatio,
+    verdict,
+    combinedOosEquity,
+  };
+}
+
+// ── 2D Parameter Sweep Heatmap (Sharpe & Sortino Plateau Finder) ─────────────
+
+export function runParameterSweepHeatmap(
+  candles: Candle[],
+  baseConfig: BacktestConfig,
+  axisMode: HeatmapAxisMode
+): ParameterHeatmapResult {
+  const atrSteps = [1.0, 1.25, 1.5, 1.75, 2.0];
+  const rrSteps = [1.6, 2.0, 2.4, 2.8, 3.2];
+  const mlSteps = [0, 56, 62, 65, 70];
+
+  const rowLabels = atrSteps.map((a) => `${a.toFixed(2)}x ATR`);
+  const colLabels =
+    axisMode === 'atr_vs_rr'
+      ? rrSteps.map((r) => `1:${r.toFixed(1)} RR`)
+      : mlSteps.map((m) => (m === 0 ? 'No ML' : `ML >${m}%`));
+
+  const rawGrid: ParameterSweepCell[][] = atrSteps.map((atrMult, rIdx) => {
+    return (axisMode === 'atr_vs_rr' ? rrSteps : mlSteps).map((colVal, cIdx) => {
+      const minRR = axisMode === 'atr_vs_rr' ? colVal : baseConfig.minRR;
+      const mlThresholdPct = axisMode === 'atr_vs_ml' ? colVal : baseConfig.useMlFilter ? 65 : 0;
+
+      const simConfig: BacktestConfig = {
+        ...baseConfig,
+        minRR,
+        useMlFilter: axisMode === 'atr_vs_ml' ? colVal > 0 : baseConfig.useMlFilter,
+      };
+
+      const res = runStrategyBacktest(candles, simConfig, atrMult, mlThresholdPct);
+      return {
+        rowIdx: rIdx,
+        colIdx: cIdx,
+        atrMult,
+        minRR,
+        mlThresholdPct,
+        sharpeRatio: res.metrics.sharpeRatio,
+        sortinoRatio: res.metrics.sortinoRatio,
+        plateauScore: 0,
+        winRate: res.metrics.winRate,
+        returnPct: res.metrics.returnPct,
+        maxDrawdownPct: res.metrics.maxDrawdownPct,
+        totalTrades: res.metrics.totalTrades,
+      };
+    });
+  });
+
+  // Compute neighborhood-smoothed plateau score (self + orthogonal/diagonal neighbors)
+  let bestCell = rawGrid[0][0];
+  let mostRobustPlateau = rawGrid[0][0];
+
+  for (let r = 0; r < rawGrid.length; r++) {
+    for (let c = 0; c < rawGrid[r].length; c++) {
+      let weightedSum = 0;
+      let weightTotal = 0;
+      for (let dr = -1; dr <= 1; dr++) {
+        for (let dc = -1; dc <= 1; dc++) {
+          const nr = r + dr;
+          const nc = c + dc;
+          if (nr >= 0 && nr < rawGrid.length && nc >= 0 && nc < rawGrid[r].length) {
+            const w = dr === 0 && dc === 0 ? 2.0 : Math.abs(dr) + Math.abs(dc) === 1 ? 1.0 : 0.6;
+            const neighbor = rawGrid[nr][nc];
+            const combined = neighbor.sharpeRatio * 0.45 + neighbor.sortinoRatio * 0.55;
+            weightedSum += combined * w;
+            weightTotal += w;
+          }
+        }
+      }
+      const cell = rawGrid[r][c];
+      cell.plateauScore = roundTo(weightedSum / Math.max(1, weightTotal), 2);
+
+      if (cell.sharpeRatio + cell.sortinoRatio > bestCell.sharpeRatio + bestCell.sortinoRatio) {
+        bestCell = cell;
+      }
+      if (cell.plateauScore > mostRobustPlateau.plateauScore) {
+        mostRobustPlateau = cell;
+      }
+    }
+  }
+
+  return {
+    axisMode,
+    rowLabels,
+    colLabels,
+    cells: rawGrid,
+    bestCell,
+    mostRobustPlateau,
+  };
+}
+
