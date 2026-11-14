@@ -1,0 +1,6 @@
+{
+  "name": "ApexSMC Quant Desk",
+  "description": "Institutional multi-strategy trading workstation featuring Smart Money Concepts, Confluence Scoring, Risk Guardrails, Backtesting, Walk-Forward Validation, and Paper Trading.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
