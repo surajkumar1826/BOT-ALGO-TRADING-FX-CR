@@ -1,0 +1,6 @@
+{
+  "summary":  "Implementation plan for full multi-timeframe support (1m to 1M), smooth hand/mouse pan and zoom chart interactions, live Y-axis price and X-axis crosshair time readouts, and persistent server/browser trading history storage.",
+  "updatedAt":  "2026-11-13T15:49:30.323573917Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}
