@@ -1,0 +1,95 @@
+@import "tailwindcss";
+
+@layer base {
+  :root,
+  [data-theme='obsidian_gold'] {
+    --font-display: 'Plus Jakarta Sans', system-ui, sans-serif;
+    --font-sans: 'DM Sans', system-ui, sans-serif;
+    --font-mono: 'JetBrains Mono', monospace;
+    --bg-canvas: #08090d;
+    --bg-sidebar: #0c0e14;
+    --bg-surface: #11131a;
+    --bg-elevated: #171a23;
+    --bg-inset: #0a0c11;
+    --border-hairline: #232734;
+    --border-strong: #32384a;
+    --accent: #d9a441;
+    --accent-hover: #e5b557;
+    --accent-fg: #090a0e;
+    --accent-soft: rgba(217, 164, 65, 0.14);
+    --accent-border: rgba(217, 164, 65, 0.45);
+    --accent-text: #f3c96b;
+    --chart-grid: #171a23;
+    --chart-bull: #14b8a6;
+    --chart-bear: #f43f5e;
+  }
+
+  [data-theme='emerald_carbon'] {
+    --bg-canvas: #070b0a;
+    --bg-sidebar: #0a100f;
+    --bg-surface: #0e1614;
+    --bg-elevated: #141f1d;
+    --bg-inset: #080d0c;
+    --border-hairline: #1d2e2b;
+    --border-strong: #2b4540;
+    --accent: #10b981;
+    --accent-hover: #34d399;
+    --accent-fg: #05130e;
+    --accent-soft: rgba(16, 185, 129, 0.14);
+    --accent-border: rgba(16, 185, 129, 0.45);
+    --accent-text: #5eead4;
+    --chart-grid: #142220;
+    --chart-bull: #10b981;
+    --chart-bear: #fb7185;
+  }
+
+  [data-theme='slate_cobalt'] {
+    --bg-canvas: #0b0f17;
+    --bg-sidebar: #0e141f;
+    --bg-surface: #101622;
+    --bg-elevated: #141c2b;
+    --bg-inset: #0b0f17;
+    --border-hairline: #1e293b;
+    --border-strong: #334155;
+    --accent: #2563eb;
+    --accent-hover: #3b82f6;
+    --accent-fg: #ffffff;
+    --accent-soft: rgba(59, 130, 246, 0.15);
+    --accent-border: rgba(59, 130, 246, 0.48);
+    --accent-text: #93c5fd;
+    --chart-grid: #162032;
+    --chart-bull: #10b981;
+    --chart-bear: #ef4444;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    background-color: var(--bg-canvas);
+    color: #e2e8f0;
+  }
+
+  h1, h2, h3, h4, .font-display {
+    font-family: var(--font-display);
+  }
+
+  .font-mono, .tabular-nums {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* Custom sleek dark scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg-canvas);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-hairline);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--border-strong);
+}
