@@ -1,0 +1,511 @@
+import React, { useState } from 'react';
+import {
+  EconomicNewsEvent,
+  LEVERAGE_OPTIONS,
+  RiskSettings,
+  StrategyId,
+  StrategyToggleState,
+  SymbolAnalysis,
+} from '../types/trading';
+import { CORRELATION_GROUPS } from '../engine/riskAndBacktest';
+import { AlertTriangle, ShieldCheck, Sliders } from 'lucide-react';
+
+interface StrategiesAndRiskViewProps {
+  strategies: StrategyToggleState;
+  onToggleStrategy: (id: StrategyId) => void;
+  risk: RiskSettings;
+  onUpdateRisk: (patch: Partial<RiskSettings>) => void;
+  newsEvents: EconomicNewsEvent[];
+  simulatedNewsBlackout: boolean;
+  onToggleSimulatedNews: () => void;
+  selectedAnalysis: SymbolAnalysis;
+}
+
+const STRATEGY_CARDS: {
+  id: StrategyId;
+  title: string;
+  timeframe: string;
+  summary: string;
+  rules: string;
+}[] = [
+  {
+    id: 'mtf_smc',
+    title: 'Multi-Timeframe H4 + SMC OTE',
+    timeframe: 'H4 Bias · M15 Entry',
+    summary: 'Aligns H4 institutional trend with M15 BOS/CHoCH, Order Blocks, FVG, and 0.618–0.786 OTE pullbacks.',
+    rules: 'Requires H4 directional bias, liquidity sweep or OB mitigation, and candle pattern confirmation.',
+  },
+  {
+    id: 'trend_following',
+    title: 'Trend Following (EMA 50/200 + ADX)',
+    timeframe: 'M15 / H4 Momentum',
+    summary: 'Trades pullbacks to EMA 50 when EMA 50/200 are stacked and ADX(14) confirms strong trend regime.',
+    rules: 'ADX(14) >= 20 filter prevents choppy sideways whipsaws; ATR trailing stop locks trend runners.',
+  },
+  {
+    id: 'session_breakout',
+    title: 'London / NY Killzone Breakout & Fakeout',
+    timeframe: '07:00–10:00 & 12:30–15:00 GMT',
+    summary: 'Marks Asian Range (00:00–06:00 GMT) high/low and captures London/NY expansion or Judas-swing fakeouts.',
+    rules: 'Optimized for XAUUSD, US30, and NAS100 liquidity expansions around session opens.',
+  },
+  {
+    id: 'mean_reversion',
+    title: 'Mean Reversion (RSI + Bollinger Bands)',
+    timeframe: 'Range / Low-ADX Regime',
+    summary: 'Fades stretched extremes at 2-sigma Bollinger Bands when RSI(14) <= 34 or >= 66 in low-ADX markets.',
+    rules: 'Active only when ADX(14) <= 26 so counter-trend entries never fight runaway trends.',
+  },
+];
+
+export const StrategiesAndRiskView: React.FC<StrategiesAndRiskViewProps> = ({
+  strategies,
+  onToggleStrategy,
+  risk,
+  onUpdateRisk,
+  newsEvents,
+  simulatedNewsBlackout,
+  onToggleSimulatedNews,
+  selectedAnalysis,
+}) => {
+  const [newsFilter, setNewsFilter] = useState<'USD' | 'ALL'>('USD');
+  const mlOut = selectedAnalysis.bestSetup?.mlFilter;
+  const visibleNews = newsFilter === 'USD' ? newsEvents.filter((ev) => ev.currency === 'USD') : newsEvents;
+  const usCount = newsEvents.filter((ev) => ev.currency === 'USD').length;
+
+  return (
+    <div className="space-y-6">
+      {/* Modular Strategies & ML Filter */}
+      <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
+        <div className="xl:col-span-8 border border-[var(--border-hairline)] bg-[var(--bg-surface)] rounded-lg p-5">
+          <div className="flex items-center justify-between gap-4 mb-4">
+            <div>
+              <h2 className="text-base font-display font-semibold text-slate-100">
+                Modular Execution Strategies
+              </h2>
+              <p className="text-xs text-slate-400 mt-0.5">
+                Enable 1–2 primary strategies or combine all 4 under Confluence Scoring. Top-3 qualitative setups (&gt;{risk.minAccuracyPct ?? 65}% accuracy) win priority.
+              </p>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {STRATEGY_CARDS.map((card) => {
+              const active = strategies[card.id];
+              return (
+                <div
+                  key={card.id}
+                  className={`p-4 rounded-md border transition-colors ${
+                    active
+                      ? 'bg-[var(--bg-elevated)] border-[var(--accent-border)]'
+                      : 'bg-[var(--bg-inset)] border-[var(--border-hairline)] opacity-75'
+                  }`}
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <div className="text-xs text-slate-400 font-mono">{card.timeframe}</div>
+                      <h3 className="text-sm font-display font-semibold text-slate-100 mt-0.5">{card.title}</h3>
+                    </div>
+                    <button
+                      onClick={() => onToggleStrategy(card.id)}
+                      className={`px-3 py-1 text-xs font-semibold rounded border transition-colors whitespace-nowrap shrink-0 ${
+                        active
+                          ? 'bg-[var(--accent)] text-[var(--accent-fg)] border-[var(--accent)]'
+                          : 'bg-[var(--bg-elevated)] text-slate-400 border-[var(--border-strong)] hover:text-slate-200'
+                      }`}
+                    >
+                      {active ? 'Enabled' : 'Disabled'}
+                    </button>
+                  </div>
+                  <p className="text-xs text-slate-300 mt-2.5 leading-relaxed">{card.summary}</p>
+                  <p className="text-[11px] text-slate-500 mt-2 pt-2 border-t border-[var(--border-hairline)]">{card.rules}</p>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* ML Signal Filter Panel */}
+        <div className="xl:col-span-4 border border-[var(--border-hairline)] bg-[var(--bg-surface)] rounded-lg p-5">
+          <div className="flex items-center justify-between gap-3 mb-3">
+            <div>
+              <h2 className="text-base font-display font-semibold text-slate-100">Qualitative Accuracy Gate (&gt;{risk.minAccuracyPct ?? 65}%)</h2>
+              <p className="text-xs text-slate-400">Blocks setups &le;{risk.minAccuracyPct ?? 65}% accuracy or low confluence (&lt;68); only qualitative entries pass.</p>
+            </div>
+            <button
+              onClick={() => onUpdateRisk({ enableMlFilter: !risk.enableMlFilter })}
+              className={`px-3 py-1 text-xs font-medium rounded border transition-colors whitespace-nowrap shrink-0 ${
+                risk.enableMlFilter
+                  ? 'bg-emerald-600/20 text-emerald-300 border-emerald-500/40'
+                  : 'bg-slate-800 text-slate-400 border-slate-700'
+              }`}
+            >
+              {risk.enableMlFilter ? 'Gate Active' : 'Gate Bypassed'}
+            </button>
+          </div>
+
+          {mlOut && (
+            <div className="space-y-3 mt-4">
+              <div className="p-3 rounded bg-[var(--bg-inset)] border border-[var(--border-hairline)]">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="text-slate-400">Active Symbol ({selectedAnalysis.meta.id})</span>
+                  <span
+                    className={`font-mono font-semibold ${
+                      mlOut.decision === 'PASS' ? 'text-emerald-400' : 'text-rose-400'
+                    }`}
+                  >
+                    {mlOut.decision} · {(mlOut.probability * 100).toFixed(1)}%
+                  </span>
+                </div>
+                <p className="text-xs text-slate-300 mt-1.5">{mlOut.reason}</p>
+              </div>
+
+              <div className="space-y-2 text-xs font-mono tabular-nums">
+                {[
+                  { label: 'ADX Normalized', val: mlOut.features.adxNormalized },
+                  { label: 'OTE Alignment', val: mlOut.features.oteAlignment },
+                  { label: 'Session Win Prior', val: mlOut.features.sessionWinPrior },
+                  { label: 'VWAP Dist (ATR)', val: mlOut.features.vwapDistanceAtr },
+                  { label: 'Volatility Z-Score', val: mlOut.features.volatilityZ },
+                ].map((f) => (
+                  <div key={f.label} className="flex items-center justify-between py-1 border-b border-[var(--border-hairline)]">
+                    <span className="text-slate-400 font-sans">{f.label}</span>
+                    <span className="text-slate-200">{f.val.toFixed(2)}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Institutional Risk Guardrails & Smart Trade Management */}
+      <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
+        <div className="xl:col-span-7 border border-[var(--border-hairline)] bg-[var(--bg-surface)] rounded-lg p-5">
+          <div className="flex items-center gap-2 mb-4">
+            <ShieldCheck className="w-4 h-4 text-emerald-400" />
+            <h2 className="text-base font-display font-semibold text-slate-100">
+              Risk Guardrails & Smart Trade Management
+            </h2>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-5">
+            <label className="block">
+              <span className="text-xs text-slate-400">Risk Per Trade (Max 1.0%)</span>
+              <input
+                type="number"
+                step="0.1"
+                min="0.2"
+                max="1.0"
+                value={risk.riskPerTradePct}
+                onChange={(e) => onUpdateRisk({ riskPerTradePct: Math.min(1.0, Math.max(0.1, Number(e.target.value))) })}
+                className="mt-1 w-full bg-[var(--bg-inset)] border border-[var(--border-strong)] rounded px-3 py-2 text-sm font-mono text-slate-100"
+              />
+            </label>
+            <label className="block">
+              <span className="text-xs text-slate-400">Daily Max Loss Limit (%)</span>
+              <input
+                type="number"
+                step="0.5"
+                min="1.0"
+                max="5.0"
+                value={risk.dailyMaxLossPct}
+                onChange={(e) => onUpdateRisk({ dailyMaxLossPct: Math.max(0.5, Number(e.target.value)) })}
+                className="mt-1 w-full bg-[var(--bg-inset)] border border-[var(--border-strong)] rounded px-3 py-2 text-sm font-mono text-slate-100"
+              />
+            </label>
+            <label className="block">
+              <span className="text-xs text-slate-400">Minimum Risk-Reward (1:X)</span>
+              <input
+                type="number"
+                step="0.2"
+                min="2.0"
+                max="5.0"
+                value={risk.minRiskReward}
+                onChange={(e) => onUpdateRisk({ minRiskReward: Math.max(2.0, Number(e.target.value)) })}
+                className="mt-1 w-full bg-[var(--bg-inset)] border border-[var(--border-strong)] rounded px-3 py-2 text-sm font-mono text-slate-100"
+              />
+            </label>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 mb-5">
+            <label className="block">
+              <span className="text-xs text-slate-400">ATR Stop-Loss Multiplier</span>
+              <input
+                type="number"
+                step="0.1"
+                min="0.8"
+                max="3.0"
+                value={risk.atrStopMultiplier}
+                onChange={(e) => onUpdateRisk({ atrStopMultiplier: Math.max(0.8, Number(e.target.value)) })}
+                className="mt-1 w-full bg-[var(--bg-inset)] border border-[var(--border-strong)] rounded px-3 py-2 text-sm font-mono text-slate-100"
+              />
+            </label>
+            <label className="block">
+              <span className="text-xs text-slate-400">Daily Max Trades (Strict Cap)</span>
+              <input
+                type="text"
+                readOnly
+                value="3 / Day (All Markets Combined)"
+                className="mt-1 w-full bg-[var(--bg-inset)] border border-[var(--border-strong)] rounded px-3 py-2 text-xs font-mono text-amber-300 cursor-not-allowed"
+              />
+              <span className="text-[10px] text-slate-500 mt-1 block">
+                Forex + Metals + Crypto + Oil + Indices combined &le; 3/day
+              </span>
+            </label>
+            <label className="block">
+              <span className="text-xs text-slate-400">Min Accuracy Filter (&gt; %)</span>
+              <input
+                type="number"
+                min="55"
+                max="85"
+                value={risk.minAccuracyPct ?? 65}
+                onChange={(e) =>
+                  onUpdateRisk({ minAccuracyPct: Math.min(85, Math.max(55, Number(e.target.value))) })
+                }
+                className="mt-1 w-full bg-[var(--bg-inset)] border border-[var(--border-strong)] rounded px-3 py-2 text-sm font-mono text-slate-100"
+              />
+            </label>
+            <label className="block">
+              <span className="text-xs text-slate-400">Max DD Kill-Switch (%)</span>
+              <input
+                type="number"
+                step="0.5"
+                min="2"
+                max="15"
+                value={risk.maxDrawdownKillSwitchPct ?? 6.0}
+                onChange={(e) =>
+                  onUpdateRisk({ maxDrawdownKillSwitchPct: Math.min(15, Math.max(2, Number(e.target.value))) })
+                }
+                className="mt-1 w-full bg-[var(--bg-inset)] border border-[var(--border-strong)] rounded px-3 py-2 text-sm font-mono text-slate-100"
+              />
+              {(() => {
+                const peak = Math.max(risk.peakAccountBalance ?? risk.accountBalance, risk.accountBalance);
+                const dd = peak > 0 ? ((peak - risk.accountBalance) / peak) * 100 : 0;
+                return (
+                  <span className="text-[10.5px] font-mono text-slate-400 mt-1 block">
+                    Peak ${peak.toLocaleString(undefined, { maximumFractionDigits: 0 })} · DD -{dd.toFixed(2)}%
+                  </span>
+                );
+              })()}
+            </label>
+          </div>
+
+          {/* Account Leverage Selector (10x–50x only) */}
+          <div className="mb-5 p-3.5 rounded-md bg-[var(--bg-inset)] border border-[var(--border-hairline)]">
+            <div className="flex flex-wrap items-center justify-between gap-2 mb-2.5">
+              <div>
+                <span className="text-xs font-semibold text-slate-200">Account Leverage</span>
+                <p className="text-[11px] text-slate-400">
+                  Controls required margin and buying power (10x, 20x, 30x, 40x, 50x only).
+                </p>
+              </div>
+              <span className="text-xs font-mono font-semibold text-[var(--accent-text)]">
+                {risk.leverage ?? 20}x Active
+              </span>
+            </div>
+            <div className="grid grid-cols-5 gap-2">
+              {LEVERAGE_OPTIONS.map((lev) => {
+                const active = (risk.leverage ?? 20) === lev;
+                return (
+                  <button
+                    key={lev}
+                    type="button"
+                    onClick={() => onUpdateRisk({ leverage: lev })}
+                    className={`py-2 rounded text-xs font-mono font-semibold border transition-colors ${
+                      active
+                        ? 'bg-[var(--accent)] border-[var(--accent)] text-[var(--accent-fg)]'
+                        : 'bg-[var(--bg-surface)] border-[var(--border-strong)] text-slate-300 hover:text-white'
+                    }`}
+                  >
+                    {lev}x
+                  </button>
+                );
+              })}
+            </div>
+            {(risk.leverage ?? 20) >= 30 ? (
+              <div className="mt-2.5 flex items-start gap-2 text-[11px] text-amber-200 bg-amber-500/10 border border-amber-500/35 rounded px-3 py-2">
+                <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
+                <span>
+                  High Leverage Warning ({risk.leverage}x): High margin utilization reduces liquidation buffer during fast volatility spikes. Paper mode recommends the <strong>20x</strong> default.
+                </span>
+              </div>
+            ) : (
+              <p className="mt-2 text-[11px] text-slate-500">
+                Default 20x balanced institutional margin active. Selecting 30x–50x increases liquidation &amp; drawdown risk.
+              </p>
+            )}
+          </div>
+
+          {/* Behavioral Toggles */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-4 border-t border-slate-800/80">
+            {(
+              [
+                {
+                  key: 'enableCorrelationGuard',
+                  label: 'Correlation & Net-USD Guard',
+                  desc: 'Blocks stacked Net-USD bets (e.g. EURUSD Long + USDCAD Short) and correlated Crypto/Metal stacking.',
+                },
+                {
+                  key: 'enableNewsFilter',
+                  label: 'High-Impact News Blackout',
+                  desc: 'Halts entries ±30m around NFP, FOMC, and CPI releases.',
+                },
+                {
+                  key: 'enablePartial1R',
+                  label: '1R Partial (50%) + Breakeven',
+                  desc: 'Books half at +1R and moves SL to entry automatically.',
+                },
+                {
+                  key: 'enableTrailingStop',
+                  label: 'ATR Structure Trailing Stop',
+                  desc: 'Trails stop dynamically once position exceeds +1.2R.',
+                },
+                {
+                  key: 'enableNewsAutoExit',
+                  label: 'News Auto-Exit Protection',
+                  desc: 'Flattens open paper positions if high-impact news enters window.',
+                },
+              ] as { key: keyof RiskSettings; label: string; desc: string }[]
+            ).map((item) => {
+              const enabled = Boolean(risk[item.key]);
+              return (
+                <button
+                  key={item.key}
+                  onClick={() => onUpdateRisk({ [item.key]: !enabled })}
+                  className={`text-left p-3 rounded border transition-colors ${
+                    enabled
+                      ? 'bg-[var(--bg-elevated)] border-emerald-500/35'
+                      : 'bg-[var(--bg-inset)] border-[var(--border-hairline)] opacity-70'
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-semibold text-slate-100">{item.label}</span>
+                    <span
+                      className={`text-[11px] font-mono ${enabled ? 'text-emerald-400' : 'text-slate-500'}`}
+                    >
+                      {enabled ? 'ON' : 'OFF'}
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-slate-400 mt-1">{item.desc}</p>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Correlation Bucket Reference */}
+          <div className="mt-5 pt-4 border-t border-[var(--border-hairline)]">
+            <div className="flex items-center gap-2 text-xs text-slate-300 font-medium mb-2">
+              <Sliders className="w-3.5 h-3.5 text-[var(--accent-text)]" />
+              Active Correlation Guard Buckets (Max 1 Position Per Direction)
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2 text-xs font-mono">
+              {Object.entries(CORRELATION_GROUPS).map(([grp, syms]) => (
+                <div key={grp} className="px-2.5 py-1.5 rounded bg-[var(--bg-inset)] border border-[var(--border-hairline)]">
+                  <div className="text-[10px] text-slate-500">{grp.replace(/_/g, ' ')}</div>
+                  <div className="text-slate-200 mt-0.5">{syms.join(' · ')}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        {/* High-Impact Economic News Blackout Calendar */}
+        <div className="xl:col-span-5 border border-[var(--border-hairline)] bg-[var(--bg-surface)] rounded-lg p-5">
+          <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
+            <div>
+              <h2 className="text-base font-display font-semibold text-slate-100">
+                USA &amp; Global Economic News Filter
+              </h2>
+              <p className="text-xs text-slate-400 mt-0.5">
+                NFP, CPI, PPI, Core PCE, FOMC, GDP, Retail Sales, ISM PMI, JOLTS &amp; EIA triggers automatic blocks (±30m).
+              </p>
+            </div>
+            <button
+              onClick={onToggleSimulatedNews}
+              className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded border transition-colors whitespace-nowrap shrink-0 ${
+                simulatedNewsBlackout
+                  ? 'bg-rose-500/20 border-rose-500/50 text-rose-300'
+                  : 'bg-[var(--bg-inset)] border-[var(--border-strong)] text-slate-300 hover:bg-[var(--bg-elevated)]'
+              }`}
+            >
+              <AlertTriangle className="w-3.5 h-3.5" />
+              {simulatedNewsBlackout ? 'Simulated NFP Active' : 'Simulate NFP Blackout'}
+            </button>
+          </div>
+
+          <div className="flex items-center justify-between gap-2 mb-3">
+            <div className="flex items-center gap-1 bg-[var(--bg-inset)] p-1 rounded border border-[var(--border-hairline)] text-[11px] font-mono">
+              <button
+                type="button"
+                onClick={() => setNewsFilter('USD')}
+                className={`px-2.5 py-1 rounded transition-colors ${
+                  newsFilter === 'USD'
+                    ? 'bg-[var(--accent)] text-[var(--accent-fg)] font-semibold'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                USA Important ({usCount})
+              </button>
+              <button
+                type="button"
+                onClick={() => setNewsFilter('ALL')}
+                className={`px-2.5 py-1 rounded transition-colors ${
+                  newsFilter === 'ALL'
+                    ? 'bg-[var(--accent)] text-[var(--accent-fg)] font-semibold'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                All ({newsEvents.length})
+              </button>
+            </div>
+            <span className="text-[11px] font-mono text-slate-500">All Times GMT</span>
+          </div>
+
+          <div className="divide-y divide-slate-800/80 border border-[var(--border-hairline)] rounded-md bg-[var(--bg-inset)] max-h-[520px] overflow-y-auto">
+            {visibleNews.map((ev) => {
+              const activeBlock = ev.inBlackout || (simulatedNewsBlackout && ev.currency === 'USD');
+              return (
+                <div key={ev.id} className="p-3 flex items-start justify-between gap-3 text-xs">
+                  <div>
+                    <div className="flex flex-wrap items-center gap-2 font-mono">
+                      <span className="text-slate-200 font-semibold">{ev.timeGmt} GMT</span>
+                      <span className="text-slate-500">·</span>
+                      <span className="text-[var(--accent-text)]">{ev.currency}</span>
+                      <span className="text-slate-500">·</span>
+                      <span className={ev.impact === 'HIGH' ? 'text-rose-400 font-semibold' : 'text-amber-400'}>
+                        {ev.impact}
+                      </span>
+                      {ev.schedule && (
+                        <>
+                          <span className="text-slate-500">·</span>
+                          <span className="text-slate-400 text-[10px]">{ev.schedule}</span>
+                        </>
+                      )}
+                    </div>
+                    <div className="text-slate-200 font-medium mt-1">{ev.title}</div>
+                    {ev.notes && <div className="text-[11px] text-slate-400 mt-0.5">{ev.notes}</div>}
+                    <div className="text-[11px] text-slate-500 mt-0.5 font-mono">
+                      Affects: {(ev.affectedSymbols ?? []).slice(0, 5).join(', ')}
+                      {(ev.affectedSymbols ?? []).length > 5 ? ` +${(ev.affectedSymbols ?? []).length - 5}` : ''}
+                    </div>
+                  </div>
+                  <span
+                    className={`font-mono text-[11px] whitespace-nowrap shrink-0 ${
+                      activeBlock ? 'text-rose-400 font-semibold' : 'text-slate-500'
+                    }`}
+                  >
+                    {(() => {
+                      const mins = Number.isFinite(ev.minutesUntil) ? ev.minutesUntil : 0;
+                      return activeBlock ? 'BLACKOUT' : mins >= 0 ? `T-${mins}m` : `T+${Math.abs(mins)}m`;
+                    })()}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
